@@ -1,5 +1,5 @@
 # hadoop_hive_ETL
-# Sprint 4 – End-to-End ETL Pipeline Using Hadoop and Hive
+
 
 ## Project Overview
 
