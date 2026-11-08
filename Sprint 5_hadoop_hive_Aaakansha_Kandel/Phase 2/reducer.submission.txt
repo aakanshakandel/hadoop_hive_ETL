@@ -1,0 +1,58 @@
+#!/usr/bin/python3
+# Reducer: sums integer counts for each category key
+# Input from mapper: "category<TAB>1"
+# Output:            "category<TAB>total_count"
+
+import sys  # Gives access to sys.stdin 
+
+# Initialize variables to track the current key and its running total
+current_key = None   # Stores the category currently being processed
+total = 0            # Stores the accumulated count for that category
+
+# Read each line from standard input (this comes from the mapper output)
+for line in sys.stdin:
+
+    # Remove leading/trailing whitespace including newline characters
+    line = line.strip()
+
+    # Skip empty lines to avoid processing invalid input
+    if not line:
+        continue
+
+    # Expecting input format: "key<TAB>value"
+    try:
+        # Split the line into key and value at the first TAB only
+        key, v = line.split('\t', 1)
+
+        # Convert the value part into an integer
+        count = int(v)
+
+    except ValueError:
+        # If the line is malformed (no TAB or value not an integer),
+        # skip it safely instead of crashing
+        continue
+
+    # If the current key is the same as the previous one,
+    # continue accumulating the total
+    if key == current_key:
+        total += count
+
+    else:
+        # If we encounter a new key, it means:
+        # - The previous key's counting is complete
+        # - should print its total before moving on
+
+        if current_key is not None:
+            # Print the previous key and its accumulated total
+            print(f"{current_key}\t{total}")
+
+        # Update current_key to the new key
+        current_key = key
+
+        # Reset total to the current count
+        total = count
+
+# After finishing the loop, must print the last key's total
+# because there is no new key to trigger the print inside the loop
+if current_key is not None:
+    print(f"{current_key}\t{total}")

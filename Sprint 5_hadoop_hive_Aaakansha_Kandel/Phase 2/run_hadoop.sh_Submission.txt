@@ -1,0 +1,228 @@
+#!/bin/bash
+# ============================================================================
+# Phase 2 Runner 
+# ----------------------------------------------------------------------------
+# This script automates an end-to-end Hadoop Streaming workflow:
+# 1) Run Phase 1 to generate local CSVs in ~/transformed
+# 2) Prepare HDFS directories (/staging and /archive) and clean /staging before starting
+# 3) Upload local CSVs to HDFS staging so the cluster can process them
+# 4) Run a Hadoop Streaming MapReduce job using mapper.py and reducer.py
+# 5) Merge the MapReduce output (part files) into one report file saved locally
+# 6) Delete the MapReduce output folder in HDFS, so future runs won’t fail
+# 7) Move inputs from /staging to /archive so /staging ends empty
+# ============================================================================
+
+# --- Safety settings for Bash scripts ---
+set -euo pipefail
+# set -e       -> If any command fails (returns non-zero), stop the script immediately.
+# set -u       -> If undefined variable used, treat it as an error and stop.
+# set -o pipefail -> In a pipeline like A | B | C, if A fails, the whole pipeline fails (not just the last command).
+# These settings prevent “half-successful” runs and make failures obvious early.
+
+# --- Default configuration values
+STREAMING_JAR="/usr/local/hadoop-3.3.1/share/hadoop/tools/lib/hadoop-streaming-3.3.1.jar"
+# Path to the Hadoop Streaming JAR. This is what lets us run Python scripts as mapper/reducer.
+
+HDFS_STAGING="/staging"        # Where inputs in HDFS for the job to read
+HDFS_OUTPUT_BASENAME="output"  # Name of the HDFS output directory (under staging) if not given as absolute
+HDFS_OUTPUT_PATH=""            # If set to an absolute HDFS path via -o, use this directly
+HDFS_ARCHIVE="/archive"        # Where we move processed inputs for traceability
+
+PHASE1_SCRIPT="$HOME/bin/phase1_fixed"  # Optional script that creates local transformed CSVs
+MAPPER="$HOME/bin/mapper.py"            # mapper program (read from stdin, write key\tvalue to stdout)
+REDUCER="$HOME/bin/reducer.py"          # reducer program (read sorted key\tvalue lines, aggregate, print)
+
+TRANSFORMED_DIR="$HOME/transformed"     # Local folder containing transformed CSVs (Phase 1 output)
+REPORTS_DIR="$HOME/reports"             # Local folder to store the final merged report
+LOGS_DIR="$HOME/logs"                   # Local folder to store logs of each run
+
+# --- Parse command-line flags, override paths when running the script ---
+# Example: ./run_hadoop.sh -s /my/staging -o my_output -a /my/archive -j /path/to/streaming.jar
+while getopts ":s:o:a:j:h" opt; do
+  case "$opt" in
+    s) HDFS_STAGING="$OPTARG" ;;  # -s sets the HDFS staging directory
+    o)
+       # -o can be either a name (e.g., "output") or an absolute HDFS path (e.g., "/data/out")
+       if [[ "$OPTARG" = /* ]]; then
+         HDFS_OUTPUT_PATH="$OPTARG"     # Absolute path wins
+       else
+         HDFS_OUTPUT_BASENAME="$OPTARG" # if run.hadoop.sh used runs the other path 
+       fi
+       ;;
+    a) HDFS_ARCHIVE="$OPTARG" ;;        # -a sets the HDFS archive directory
+    j) STREAMING_JAR="$OPTARG" ;;       # -j sets the Hadoop Streaming JAR path
+    h)
+       # Print usage help and exit
+       echo "Usage: $(basename "$0") [-s <hdfs_staging>] [-o <output|/abs/output>] [-a <hdfs_archive>] [-j <streaming_jar>]"
+       echo "Defaults: -s /staging  -o output (=> /staging/output)  -a /archive"
+       exit 0
+       ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; exit 2 ;;           # Unknown flag
+    :)  echo "Option -$OPTARG requires an argument" >&2; exit 2 ;; # Missing value after a flag
+  esac
+done
+
+# --- Create a timestamp and a log file name for this run ---
+TS="$(date +%Y%m%d-%H%M%S)"                     # Format: YYYYMMDD-HHMMSS (sorts nicely)
+LOGFILE="$LOGS_DIR/phase2_log_${TS}.txt"        # Each run has its own log file
+
+# --- logging function to print to screen and append to log file ---
+log(){ echo "[$(date +%F_%T)] $*" | tee -a "$LOGFILE"; }
+# %F_%T -> date and time like 2026-02-26_15:20:10 for easy reading in logs
+
+# --- Make sure local folders exist and start with a fresh (empty) log file ---
+mkdir -p "$REPORTS_DIR" "$LOGS_DIR"  # -p means “create if needed; don’t error if already exists”
+: > "$LOGFILE"                        # Truncate the file so it contains only this run’s logs
+
+# =============================================================================
+# STEP 1: Run Phase 1 (optional) to generate local transformed CSVs
+# - If a Phase 1 script exists, run it now to (re)build ~/transformed/*.csv
+# - If not, get them from transformed folders 
+# =============================================================================
+if [[ -f "$PHASE1_SCRIPT" ]]; then
+  [[ -x "$PHASE1_SCRIPT" ]] || chmod +x "$PHASE1_SCRIPT"  # Ensure the script is executable
+  log "STEP 1/7: Running Phase 1 -> $PHASE1_SCRIPT"
+  "$PHASE1_SCRIPT" | tee -a "$LOGFILE"                    # Run Phase 1 and log its output too
+else
+  log "STEP 1/7: Phase 1 not found at $PHASE1_SCRIPT; continuing with existing transformed files."
+fi
+
+# --- confirm there are local CSV files to process ---
+# If none are found, exit early with a clear message.
+ls "$TRANSFORMED_DIR"/*.csv >/dev/null 2>&1 || { log "No CSVs in $TRANSFORMED_DIR"; exit 1; }
+
+# =============================================================================
+# STEP 2: Ensure HDFS folders exist; clean staging pre-run 
+# - Create /staging and /archive on HDFS if they don’t exist.
+# - Clean /staging/* BEFORE uploading new files so there are no double-count.
+# =============================================================================
+hdfs dfs -mkdir -p "$HDFS_STAGING" "$HDFS_ARCHIVE"  # Create HDFS dirs (idempotent)
+log "STEP 2/7: HDFS dirs ready -> staging=$HDFS_STAGING  archive=$HDFS_ARCHIVE"
+
+# Clean /staging at the start:
+#  - Quoted glob "${HDFS_STAGING%/}/*" ensures HDFS, not the local shell, expands the *
+#  - -skipTrash removes immediately, it doesn't get sent to HDFS TRASH
+#  - 2>/dev/null hides “No such file” noise; || true means “don’t fail if empty”
+if hdfs dfs -test -d "$HDFS_STAGING"; then
+  hdfs dfs -rm -r -f -skipTrash "${HDFS_STAGING%/}/*" 2>/dev/null || true
+fi
+log "STEP 2/7: Staging cleaned pre-run -> ${HDFS_STAGING}"
+
+# Decide where MapReduce will write output:
+#  - If the user passed -o /absolute/path, use that.
+#  - Otherwise staging + basename, e.g., /staging/output
+if [[ -z "${HDFS_OUTPUT_PATH:-}" ]]; then
+  HDFS_OUTPUT_PATH="${HDFS_STAGING%/}/${HDFS_OUTPUT_BASENAME}"
+fi
+
+# Hadoop Streaming will read actual FILES (not the folder object).
+# The INPUT_GLOB tells Hadoop to read everything under /staging.
+INPUT_GLOB="${HDFS_STAGING%/}/*"
+log "Paths -> INPUT_GLOB=$INPUT_GLOB  OUTPUT_PATH=$HDFS_OUTPUT_PATH"
+
+# =============================================================================
+# STEP 3: Upload transformed CSVs to HDFS staging
+# - Put local CSVs into HDFS so the cluster can access and process them.
+# - -put -f overwrites files of the same name (keeps staging current).
+# =============================================================================
+for f in "$TRANSFORMED_DIR"/*.csv; do
+  hdfs dfs -put -f "$f" "$HDFS_STAGING"/
+done
+log "STEP 3/7: Uploaded transformed CSVs to $HDFS_STAGING"
+
+# Safety check: confirm HDFS staging actually has files (prevents empty job)
+if ! hdfs dfs -ls -C "$HDFS_STAGING" >/dev/null 2>&1; then
+  log "No files present in HDFS staging: $HDFS_STAGING"
+  exit 1
+fi
+
+# =============================================================================
+# STEP 4: Submit Hadoop Streaming (mapper + reducer)
+# - Validate Hadoop CLI and the streaming JAR exist.
+# - Hadoop requires the output directory to NOT exist beforehand.
+# - Build the Streaming command and run it. All logs are captured.
+# =============================================================================
+# Check required commands are available in PATH
+command -v hadoop >/dev/null 2>&1 || { log "hadoop not found in PATH"; exit 1; }
+command -v hdfs   >/dev/null 2>&1 || { log "hdfs not found in PATH"; exit 1; }
+# Check the Streaming JAR actually exists at the path we expect
+[[ -f "$STREAMING_JAR" ]] || { log "Streaming JAR not found: $STREAMING_JAR"; exit 1; }
+
+# Hadoop will error if output dir already exists; remove it if present.
+if hdfs dfs -test -e "$HDFS_OUTPUT_PATH"; then
+  hdfs dfs -rm -r -f -skipTrash "$HDFS_OUTPUT_PATH"
+fi
+
+# Some environments require the mapper and reducer files to have execute permission.
+chmod +x "$MAPPER" "$REDUCER"
+
+# Build the list of Streaming arguments:
+#  - -files ships the mapper and reducer to the worker nodes
+#  - -mapper/-reducer tell Hadoop how to execute them
+#  - -input is a glob of HDFS files for the job to read
+#  - -output is where the job writes results in HDFS
+streaming_args=(
+  -files "$MAPPER"
+  -files "$REDUCER"
+  -mapper "$(basename "$MAPPER")"
+  -reducer "$(basename "$REDUCER")"
+  -input "$INPUT_GLOB"
+  -output "$HDFS_OUTPUT_PATH"
+)
+
+log "STEP 4: Submitting Hadoop Streaming job"
+log "CMD: hadoop jar $STREAMING_JAR ${streaming_args[*]}"
+# Run the job. capture both stdout and stderr and also write them to the log file.
+hadoop jar "$STREAMING_JAR" "${streaming_args[@]}" 2>&1 | tee -a "$LOGFILE"
+
+# =============================================================================
+# STEP 5: Collect MapReduce output into a single local report
+# - MapReduce writes multiple part files in HDFS (part-00000, part-00001, ...)
+# - Concatenate them into ONE text file saved locally (easy to view/submit).
+# =============================================================================
+OUTFILE="$REPORTS_DIR/MRout_${TS}.txt"   # Local, timestamped report file path
+# hdfs dfs -cat prints the content of all part-* files; redirect (>) saves it locally
+hdfs dfs -cat "$HDFS_OUTPUT_PATH"/part-* > "$OUTFILE"
+log "STEP 5: Report created -> $OUTFILE"
+
+# =============================================================================
+# STEP 6: Remove HDFS MR output so re-runs don't fail
+# - Hadoop Streaming jobs require a new output directory each time.
+
+# =============================================================================
+hdfs dfs -rm -r -f -skipTrash "$HDFS_OUTPUT_PATH"
+log "STEP 6/7: Removed HDFS MR output -> $HDFS_OUTPUT_PATH"
+
+# =============================================================================
+# STEP 7/7: Archive staged inputs to /archive (staging ends empty)
+# - Default behavior: move inputs to /archive to keep a history of processed data.
+# - If mv fails (e.g., different HDFS mount), copy then delete as a fallback.
+#   Example: DELETE_INSTEAD_OF_ARCHIVE=true ./run_hadoop.sh 
+# =============================================================================
+DELETE_INSTEAD_OF_ARCHIVE="${DELETE_INSTEAD_OF_ARCHIVE:-false}"
+
+if [[ "$DELETE_INSTEAD_OF_ARCHIVE" == "true" ]]; then
+  # Hard delete everything under /staging (no archive kept)
+  hdfs dfs -rm -r -f -skipTrash "${HDFS_STAGING%/}/*" 2>/dev/null || true
+  log "STEP 7/7: Deleted all contents under $HDFS_STAGING (no archive)"
+else
+  # Move everything from /staging to /archive in one command.
+  # The quoted glob ensures HDFS expands '*', not the local shell.
+  if ! hdfs dfs -mv "${HDFS_STAGING%/}/*" "${HDFS_ARCHIVE%/}/" 2>/dev/null; then
+    # If mv fails (e.g., cross-filesystem move is not allowed), copy then delete instead.
+    log "STEP 7/7: Direct mv failed; attempting copy+delete fallback."
+    hdfs dfs -cp -p "${HDFS_STAGING%/}/*" "${HDFS_ARCHIVE%/}/" 2>/dev/null || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_STAGING%/}/*" 2>/dev/null || true
+  fi
+
+  # Final check: if anything is still in /staging, list it
+  if hdfs dfs -ls -C "$HDFS_STAGING" >/dev/null 2>&1; then
+    log "STEP 7/7: WARNING: Some items remained in staging after archiving:"
+    hdfs dfs -ls -R "$HDFS_STAGING" | tee -a "$LOGFILE"
+  else
+    log "STEP 7/7: Archived inputs to $HDFS_ARCHIVE; staging is now empty."
+  fi
+fi
+
+# Final message for script finish without errors 
+log "Done."

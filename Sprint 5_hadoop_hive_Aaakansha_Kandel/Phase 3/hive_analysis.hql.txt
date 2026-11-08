@@ -1,0 +1,49 @@
+-- hive_analysis.sh
+-- Phase 3 Hive job using Phase 1 transformed files
+-- Primary output: TWO COLUMNS -> category, transaction_count
+-- Summary output: total transactions + average € per category
+-- Parameters passed from Bash: ${STAGING_PATH}, ${OUTPUT_PATH}
+
+-- 1) Create a managed table that matches Phase 1 output schema
+CREATE TABLE IF NOT EXISTS phase3_transactions (
+  category STRING,   -- 'chip' | 'online' | 'swipe'  (from Phase 1)
+  place    STRING,   -- city/place name               (from Phase 1)
+  value_eur DOUBLE   -- € value with 3 decimals       (from Phase 1)
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+-- 2) Load the latest batch from HDFS staging into the table
+--    OVERWRITE ensures re-runs are clean
+LOAD DATA INPATH '${STAGING_PATH}'
+OVERWRITE INTO TABLE phase3_transactions;
+
+-- 3) MAIN REPORT : count transactions per category
+--    -> Writes two columns to ${OUTPUT_PATH}/categories_count
+INSERT OVERWRITE DIRECTORY '${OUTPUT_PATH}/categories_count'
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\t'
+SELECT
+  category,
+  COUNT(*) AS transaction_count
+FROM phase3_transactions
+GROUP BY category
+ORDER BY transaction_count DESC;
+
+-- 4) SUMMARY:
+--    - total transactions
+--    - average € per category
+--    -> Writes labeled metrics to ${OUTPUT_PATH}/summary with two columns: metric, value
+INSERT OVERWRITE DIRECTORY '${OUTPUT_PATH}/summary'
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\t'
+SELECT 'TOTAL_TRANSACTIONS' AS metric, CAST(COUNT(*) AS STRING) AS value
+FROM phase3_transactions
+UNION ALL
+SELECT CONCAT('AVG_VALUE_EUR_', category) AS metric,
+       CAST(ROUND(AVG(value_eur), 3) AS STRING) AS value
+FROM phase3_transactions
+GROUP BY category
+ORDER BY metric;
+``

@@ -1,0 +1,105 @@
+#!/bin/bash
+# -----------------------------------------
+# PHASE 3 - Hive + HDFS Pipeline
+# -----------------------------------------
+#
+# - Aborts if Phase 1 (phase1_fixed) is running
+# - Uploads /home/fdmuser/transformed/*.csv to HDFS staging
+# - Executes Hive script: /home/fdmuser/bin/hive_analysis.hql
+# - Writes a timestamped report to /home/fdmuser/reports
+# - Cleans HDFS output so re-runs are clean
+# - Archives processed HDFS staging files to HDFS archive
+# - Logs all steps to /home/fdmuser/logs
+# -----------------------------------------
+
+set -euo pipefail
+
+# -------- DEFAULT HDFS DIRECTORIES --------
+STAGING="/user/$USER/phase3/staging"
+OUTPUT="/user/$USER/phase3/output"
+ARCHIVE="/user/$USER/phase3/archive"
+
+# -------- Fixed local paths --------
+TS="$(date +%Y%m%d-%H%M%S)"
+LOG_DIR="/home/fdmuser/logs"
+REPORT_DIR="/home/fdmuser/reports"
+TRANSFORMED_DIR="/home/fdmuser/transformed"
+HQL_PATH="/home/fdmuser/bin/hive_analysis.hql"
+LOGFILE="$LOG_DIR/phase3_${TS}.txt"
+REPORT="$REPORT_DIR/HIVEout_${TS}.txt"
+
+mkdir -p "$LOG_DIR" "$REPORT_DIR"
+
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"; }
+
+log "Phase 3 started with:"
+log "  STAGING = $STAGING"
+log "  OUTPUT  = $OUTPUT"
+log "  ARCHIVE = $ARCHIVE"
+log "  HQL     = $HQL_PATH"
+log "  REPORT  = $REPORT"
+
+#  --------0) Ensure HDFS user home exists --------
+hdfs dfs -test -d "/user/$USER" || hdfs dfs -mkdir -p "/user/$USER" || true
+
+# -------- 1) Abort if Phase 1 still running --------
+if pgrep -f "phase1_fixed" >/dev/null 2>&1; then
+  log "Phase 1 (phase1_fixed) is still running. Aborting Phase 3."
+  exit 1
+fi
+
+# -------- 2) Confirm HQL exists --------
+if [[ ! -f "$HQL_PATH" ]]; then
+  log "Hive script not found at $HQL_PATH. Please place hive_analysis.hql there."
+  exit 1
+fi
+
+# -------- 3) Confirm transformed files exist --------
+if ! ls "$TRANSFORMED_DIR"/*.csv >/dev/null 2>&1; then
+  log "No transformed CSV files found in $TRANSFORMED_DIR. Nothing to process."
+  exit 0
+fi
+FILES_TO_UPLOAD=$(ls "$TRANSFORMED_DIR"/*.csv | wc -l | tr -d ' ')
+log "Found $FILES_TO_UPLOAD transformed file(s) to process."
+
+# -------- 4) Ensure HDFS directories --------
+hdfs dfs -mkdir -p "$STAGING" "$OUTPUT" "$ARCHIVE"
+
+# -------- 5) Upload transformed files to HDFS staging --------
+log "Uploading transformed files to HDFS staging..."
+hdfs dfs -put -f "$TRANSFORMED_DIR"/*.csv "$STAGING"
+
+# -------- 6) Run Hive job --------
+log "Running Hive analysis via: hive -f $HQL_PATH"
+hive -S \
+  -d STAGING_PATH="$STAGING" \
+  -d OUTPUT_PATH="$OUTPUT" \
+  -f "$HQL_PATH"
+
+# -------- 7) Build local report from HDFS output --------
+log "Building report at $REPORT ..."
+{
+  echo -e "category\ttransaction_count"
+  hdfs dfs -cat "$OUTPUT"/categories_count/* 2>/dev/null || true
+
+  echo
+  echo "----- summary (metrics) -----"
+  echo -e "metric\tvalue"
+  hdfs dfs -cat "$OUTPUT"/summary/* 2>/dev/null || true
+} > "$REPORT"
+
+log "Report created: $REPORT"
+
+# -------- 8) Clean HDFS output so job can re-run cleanly --------
+log "Cleaning HDFS output directory: $OUTPUT"
+hdfs dfs -rm -r -f -skipTrash "$OUTPUT" || true
+hdfs dfs -mkdir -p "$OUTPUT"
+
+# -------- 9) Archive processed staging files --------
+log "Archiving processed files from $STAGING to $ARCHIVE ..."
+if hdfs dfs -ls "$STAGING" >/dev/null 2>&1; then
+  hdfs dfs -mv "$STAGING"/* "$ARCHIVE"/ 2>/dev/null || true
+fi
+
+log "Phase 3 completed successfully."
+exit 0

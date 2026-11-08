@@ -1,0 +1,26 @@
+#!/usr/bin/python3
+# Mapper: reads CSV rows "category,place,value_eur" from STDIN
+# and emits "category<TAB>1" (one count per transaction)
+# Example input row:  chip,Sydney,17.066
+# Example output:     chip    1
+
+import sys #gives access to system input/output streams(like STDIN)
+import csv #lets you parse CSV safely
+
+# csv.reader parses each STDIN(standard input) line as a CSV row safely (handles commas properly)
+reader = csv.reader(sys.stdin)
+
+for row in reader:
+    # Guard against blank or malformed lines(empty row/column)
+    if not row or len(row) < 1:
+        continue #skip code and move to next
+
+    # Column 0 is 'transaction_category' after Phase 1 transforms
+    category = row[0].strip() 
+    if not category:  #if category empty skip the row 
+        continue
+
+    # Emit key-value pair for Hadoop Streaming: category and a count of 1
+    # Hadoop captures this as "category<TAB>1"
+    print(f"{category}\t1")
+

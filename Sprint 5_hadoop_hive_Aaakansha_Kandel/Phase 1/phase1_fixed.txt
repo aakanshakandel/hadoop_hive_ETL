@@ -1,0 +1,298 @@
+#!/bin/bash
+###############################################################################
+# PHASE 1 – COMPLETE PIPELINE (Steps 1–4)
+#
+# THIS SCRIPT:
+# - Looks for CSV files in ~/source
+# - For each CSV file:
+#     1) Moves it into ~/staging (so it is "in progress")
+#     2) Cleans/transforms the data and writes output into ~/transformed
+#     3) Moves the staged file into ~/archive (so it is never processed again)
+#
+# - Processes one file at a time 
+# - Staging isolates "in-progress" work (if script crashes, staging shows it)
+# - Archiving prevents the same input from being reprocessed (idempotence)
+# - Logging provides an audit trail for what happened and when
+###############################################################################
+
+set -euo pipefail
+# -e: exit immediately if any command fails (prevents silent failures)
+# -u: treat unset variables as an error (prevents bugs from typos/missing vars)
+# -o pipefail: if a pipeline fails in the middle, treat the whole pipeline as failed
+
+###############################################################################
+# DIRECTORIES
+###############################################################################
+SOURCE_DIR="$HOME/source"        # Raw input CSVs (Extract starts here)
+STAGING_DIR="$HOME/staging"      # Temporary work area for in-progress file
+TRANSFORMED_DIR="$HOME/transformed"  # Final cleaned outputs (Load output)
+ARCHIVE_DIR="$HOME/archive"      # Original files moved here after processing
+LOG_DIR="$HOME/logs"             # Where run logs are stored
+
+RUN_TS="$(date +%Y%m%d-%H%M%S)"
+# RUN_TS is a run timestamp used to make filenames unique and traceable.
+
+
+LOG_FILE="$LOG_DIR/phase1_log_${RUN_TS}.txt"
+# One log per run. This makes it easy to show evidence of each run in the demo.
+
+
+###############################################################################
+# LOGGING (prints to screen + saves to file)
+###############################################################################
+log() {
+    # This function standardises all log messages.
+    # It attaches a timestamp and writes to both:
+    #  - console (for the demo)
+    #  - log file (for evidence/audit trail)
+    local now
+    now="$(date '+%Y-%m-%d %H:%M:%S')"   # Human-readable time for log messages
+    echo "[$now] $*" | tee -a "$LOG_FILE"
+    # tee prints to stdout and appends to LOG_FILE at the same time
+}
+
+###############################################################################
+# STEP 0 — Initialise LOG FILE
+###############################################################################
+
+  log "=== STEP 0 START: LOGGING HAS STARTED ==="  # Mark start of step in logs
+
+
+
+
+
+###############################################################################
+# STEP 1 — Identify CSV files in source
+###############################################################################
+step1_identify_csvs() {
+
+  log "=== STEP 1 START: Identify CSV files ==="  # Mark start of step in logs
+
+
+  csv_files=()
+  # csv_files is an array storing all discovered CSV file paths.
+
+  for f in "$SOURCE_DIR"/*.csv; do #for evey file in the source directory 
+       #that ends with .csv, assign it to variable f and run the loop. 
+      # Loop through all *.csv matches.
+      # If there are no matches, Bash keeps the literal pattern "$SOURCE_DIR/*.csv"
+      # (it does not expand). This check prevents treating that literal as a file.
+      [[ "$f" == "$SOURCE_DIR/*.csv" ]] && break
+
+      csv_files+=("$f")
+      # If it is a real file, add full path to array.
+  done
+
+  if (( ${#csv_files[@]} == 0 )); then
+      # If no CSV files found, log and exit early (nothing to process).
+      log "No CSV files found in source."
+      log "=== Process Ending ==="
+      exit
+  fi
+
+  # Log the number of discovered files and list them for transparency.
+  log "Found ${#csv_files[@]} CSV file(s):" 
+  for f in "${csv_files[@]}"; do #[@] all elements in array [csv_files]
+      log "  - $(basename "$f")"
+      # basename prints only the filename, not the full directory path.
+  done
+
+  log "=== STEP 1 COMPLETE ==="
+}
+
+###############################################################################
+# STEP 2 — Stage file
+###############################################################################
+stage_one_file() {
+    # Staging moves the file out of source and into staging.
+    # Why stage:
+    # - prevents reprocessing: file is removed from source immediately
+    # - shows in-progress work: if crash happens, file will be left in staging
+ 
+
+    local src="$1"
+    # src is the input file(original) path passed into this function.
+
+    base=$(basename "$src")
+    # base is the filename only, e.g., transactions_chunk_1.csv
+
+    name="${base%.*}"
+    # name removes extension, e.g., transactions_chunk_1
+    # %remove from end, .* everything later 
+    staged="$STAGING_DIR/${name}_${RUN_TS}.csv"
+    # staged filename includes run timestamp so it is unique and traceable.
+
+    log "Staging file: $base → $(basename "$staged")"
+
+    mv "$src" "$staged"
+    # Move file into staging so it is removed from source.
+}
+
+###############################################################################
+# STEP 3 — Transform staged file 
+###############################################################################
+transform_one_file() {
+    # Transform reads the staged file row-by-row and outputs cleaned data.
+    # The transformation:
+    # - skips CSV header
+    # - skips rows with errors 
+    # - removes $ from amount
+    # - converts USD to EUR using RATE
+    # - normalizes category into chip/online/swipe
+    # - outputs only: category, place, eur_value
+
+    staged_file="$1"                       # Full path of staged file passed in
+    base=$(basename "$staged_file")        # Filename only
+    output_file="$TRANSFORMED_DIR/$base"   # Output filename matches staged filename
+
+
+    RATE="${USD_TO_EUR:-0.92}"
+    # Use env var USD_TO_EUR if set; otherwise default to 0.92.
+
+    log "Transforming: $base"
+    log "Using exchange rate USD→EUR: $RATE"
+
+    awk -v FS="," -v OFS="," -v rate="$RATE" -v logfile="$LOG_FILE" '
+        # FS="," tells awk the input is comma separated.
+        # OFS="," tells awk to write comma separated output.
+        # rate and logfile are passed in from Bash.
+
+        NR==1 {
+            # NR is line number in the file.
+            # The first line is the header, so skip it.
+            printf("[%s] Skipping header row.\n",
+                   strftime("%Y-%m-%d %H:%M:%S")) >> logfile
+            next
+        }
+
+        {
+            # Assign columns to meaningful variables
+            original_amount = $7   # Amount field (may include a leading $)
+            category_raw    = $8   # Category field
+            place           = $10  # Merchant city/place
+            errors          = $14  # Error message field
+
+            # 1) Skip invalid rows and log why for traceability
+            if (errors != "" && errors != "null" && errors != "NULL") {
+                printf("[%s] Skipping row %d due to error: %s\n",
+                       strftime("%Y-%m-%d %H:%M:%S"), NR, errors) >> logfile
+                next
+            }
+
+            # 2) Remove currency symbol if it exists
+            if (original_amount ~ /^\$/) {
+                # Regex /^\$/ checks if amount begins with $.
+                printf("[%s] Row %d: Removed currency symbol from amount: %s\n",
+                       strftime("%Y-%m-%d %H:%M:%S"), NR, original_amount) >> logfile
+            }
+            sub(/^\$/, "", original_amount)
+            # sub removes the leading $ so amount can be treated as numeric.
+
+            # 3) Convert USD to EUR and format with 3 decimals
+            eur_value = sprintf("%.3f", original_amount * rate)
+            printf("[%s] Row %d: Converted USD %s → EUR %s\n",
+                   strftime("%Y-%m-%d %H:%M:%S"), NR, original_amount, eur_value) >> logfile
+
+            # 4) Normalize category by lowercasing
+            category_lower = tolower(category_raw)
+            if (category_raw != category_lower) {
+                printf("[%s] Row %d: Lowercased category \"%s\" → \"%s\"\n",
+                       strftime("%Y-%m-%d %H:%M:%S"), NR, category_raw, category_lower) >> logfile
+            }
+
+            # 5) Map to standard categories: chip, online, swipe
+            mapped = category_lower
+            if (mapped ~ /chip/) mapped = "chip"
+            else if (mapped ~ /online/) mapped = "online"
+            else mapped = "swipe"
+
+            if (mapped != category_lower) {
+                printf("[%s] Row %d: Normalized category \"%s\" → \"%s\"\n",
+                       strftime("%Y-%m-%d %H:%M:%S"), NR, category_lower, mapped) >> logfile
+            }
+
+            # 6) Output cleaned record (schema reduction to 3 columns)
+            print mapped, place, eur_value
+        }
+
+    ' "$staged_file" > "$output_file"
+    # Redirect awk output into the transformed output file.
+
+    log "Completed transformation: $base"
+}
+
+###############################################################################
+# STEP 4 — Archive staged file
+###############################################################################
+archive_one_file() {
+    # Archive moves the staged file into archive after successful transformation.
+    # Why archive:
+    # - prevents reprocessing (file is no longer in source or staging)
+    # - keeps original raw data for audit/history
+
+    staged_file="$1"                   # Input staged file path
+    base=$(basename "$staged_file")    # Filename only for logging and naming
+
+    log "Archiving file: $base"
+    mv "$staged_file" "$ARCHIVE_DIR/$base"
+    # Move file out of staging into archive so staging stays clean.
+}
+
+###############################################################################
+# MAIN PIPELINE
+###############################################################################
+log "===== PHASE 1 PIPELINE START (RUN_TS=$RUN_TS) ====="
+mkdir -p "$STAGING_DIR" "$ARCHIVE_DIR" "$LOG_DIR" "$SOURCE_DIR" "$TRANSFORMED_DIR"
+# Ensure these folders exist before starting.
+
+# Clean leftover staged files
+# If a previous run crashed mid-file, staging may contain files.
+# This script archives them immediately to ensure staging starts clean.
+leftovers=()
+for item in "$STAGING_DIR"/*; do
+    [[ "$item" == "$STAGING_DIR/*" ]] && break   # If empty, stop loop
+    leftovers+=("$item")                         # Otherwise, record leftover file
+    log "Found leftover staged files: $leftovers"
+done
+
+if (( ${#leftovers[@]} > 0 )); then
+    log "Found leftover staged files — archiving them now:"
+    for lf in "${leftovers[@]}"; do
+        mv "$lf" "$ARCHIVE_DIR/"
+        log "  Discarded leftover file: $(basename "$lf")"
+    done
+else
+    log "Staging area clean — no leftovers."
+fi
+
+# STEP 1 — Discover files
+step1_identify_csvs
+
+# TRUE sequential file processing loop
+# Each CSV file is staged, transformed, and archived fully before moving on.
+for f in "$SOURCE_DIR"/*.csv; do
+    [[ "$f" == "$SOURCE_DIR/*.csv" ]] && break  # Handles case: no CSV files exist
+
+    log "----------------------------------------------"
+    log "Starting full ETL cycle for: $(basename "$f")"
+
+    stage_one_file "$f"
+    # After staging, the file is removed from SOURCE_DIR and placed in STAGING_DIR.
+
+    staged_name="$(basename "$f" .csv)_${RUN_TS}.csv"
+    # Rebuild the staged filename (must match stage_one_file naming rules).
+
+    staged_path="$STAGING_DIR/$staged_name"
+    # Full path to the staged file we will transform and archive.
+
+    transform_one_file "$staged_path"
+    # Runs awk transformation and writes output into TRANSFORMED_DIR.
+
+    archive_one_file "$staged_path"
+    # Moves staged file into ARCHIVE_DIR after transformation.
+
+    log "Finished ETL cycle for: $(basename "$f")"
+    log "----------------------------------------------"
+done
+
+log "===== PHASE 1 PIPELINE COMPLETE ====="
